@@ -22,9 +22,9 @@ app.add_middleware(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load BLIP2
-blip_processor = Blip2Processor.from_pretrained("Salesforce/blip2-flan-t5-xl")
+blip_processor = Blip2Processor.from_pretrained("Salesforce/blip2-flan-t5-base")
 blip_model = Blip2ForConditionalGeneration.from_pretrained(
-    "Salesforce/blip2-flan-t5-xl",
+    "Salesforce/blip2-flan-base",
     device_map="auto",
     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
 )
