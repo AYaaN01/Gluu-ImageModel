@@ -8,6 +8,7 @@ import torch
 import httpx
 import json
 import io
+import time
 
 app = FastAPI()
 app.add_middleware(
@@ -54,6 +55,7 @@ class ReportResponse(BaseModel):
     condition_score: int
     condition_report: str
     tags: List[str]
+    timetaken: float
 
 def analyze_with_blip(image: Image.Image, label_list: List[str], label_type: str = "object") -> str:
     best_label = "Unknown"
@@ -111,12 +113,18 @@ async def call_phi4(product_type: str, material: str, tags: List[str]) -> str:
                 json={"model": "phi4:14b-q4_K_M", "prompt": prompt},
                 timeout=60.0
             )
+
             summary = ""
-            for line in response.iter_lines():
-                if line:
-                    data = json.loads(line.decode("utf-8"))
-                    summary += data.get("response", "")
+            async for chunk in response.aiter_text():
+                if chunk.strip():
+                    try:
+                        data = json.loads(chunk)
+                        summary += data.get("response", "")
+                    except json.JSONDecodeError:
+                        continue  # Ignore bad chunks
+
             return summary.strip()
+
         except Exception as e:
             raise RuntimeError(f"Ollama request failed: {e}")
 
@@ -127,6 +135,8 @@ async def startup_warmup():
 
 @app.post("/analyze-images", response_model=ReportResponse)
 async def analyze_images(files: List[UploadFile] = File(...)):
+    start_time = time.time()
+    
     if not files:
         raise HTTPException(status_code=400, detail="No images uploaded.")
 
@@ -157,12 +167,15 @@ async def analyze_images(files: List[UploadFile] = File(...)):
         report = await call_phi4(product_type, material, unique_tags)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
-
+    
+    elapsed = round(time.time() - start_time, 2)
+    
     return ReportResponse(
         success=True,
         product_type=product_type,
         material=material,
         condition_score=condition_score,
         condition_report=report,
-        tags=unique_tags
+        tags=unique_tags,
+        timetaken=elapsed
     )
