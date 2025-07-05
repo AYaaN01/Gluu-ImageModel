@@ -1,0 +1,168 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from typing import List
+from pydantic import BaseModel
+from PIL import Image
+from transformers import Blip2Processor, Blip2ForConditionalGeneration
+import torch
+import httpx
+import json
+import io
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# Device setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load BLIP2
+blip_processor = Blip2Processor.from_pretrained("Salesforce/blip2-flan-t5-xl")
+blip_model = Blip2ForConditionalGeneration.from_pretrained(
+    "Salesforce/blip2-flan-t5-xl",
+    device_map="auto",
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+)
+
+# Labels
+OBJECT_LABELS = ["Shoe", "Watch", "Wallet", "Bag", "Purse", "Glasses", "Hat", "Phone", "Jacket", "Belt"]
+MATERIAL_LABELS = ["Leather", "Canvas", "Suede", "Synthetic", "Rubber", "Metal", "Plastic", "Glass", "Wood", "Fabric"]
+
+# Condition tags
+PRODUCT_TAGS = {
+    "Shoe": ["creased toe box", "worn sole", "heel wear", "misaligned heel", "sole intact", "upper intact", "visible scuff marks", "clean surface", "smooth finish", "like new"],
+    "Watch": ["shiny bezel", "scratched glass", "buckle rusted", "strap discolored", "dial clean", "metal polished", "clean surface", "dial dirty", "well maintained"],
+    "Wallet": ["soft leather", "strap cracked", "zipper broken", "corners frayed", "lining clean", "logo faded"],
+    "Bag": ["strap cracked", "zipper broken", "lining clean", "corners frayed", "logo faded", "torn material"],
+    "Purse": ["zipper broken", "soft leather", "strap wrinkled", "pristine condition"],
+    "Glasses": ["frame intact", "lens scratched", "hinge loose", "nose pad clean", "lens spotless"],
+    "Hat": ["brim firm", "fabric stretched", "collar worn", "fabric smooth"],
+    "Phone": ["screen pristine", "cracked screen", "back cover intact", "body dented", "buttons responsive", "frame scuffed"],
+    "Jacket": ["buttons intact", "fabric smooth", "collar worn", "lining damaged"],
+    "Belt": ["buckle polished", "buckle rusted", "holes stretched", "strap wrinkled", "leather supple", "strap smooth"]
+}
+
+class ReportResponse(BaseModel):
+    success: bool
+    product_type: str
+    material: str
+    condition_score: int
+    condition_report: str
+    tags: List[str]
+
+def analyze_with_blip(image: Image.Image, label_list: List[str], label_type: str = "object") -> str:
+    best_label = "Unknown"
+    best_confidence = 0
+    for label in label_list:
+        prompt = f"What is shown in the image? Is the {label_type} a {label}?"
+        inputs = blip_processor(images=image, text=prompt, return_tensors="pt").to(blip_model.device)
+        with torch.no_grad():
+            output = blip_model.generate(**inputs, max_new_tokens=15)
+            answer = blip_processor.decode(output[0], skip_special_tokens=True).lower()
+        if any(word in answer for word in ["yes", "definitely", "clearly"]):
+            return label
+        elif any(word in answer for word in ["probably", "maybe", "likely"]):
+            best_label = label
+    return best_label
+
+def extract_tags_batch(image: Image.Image, product_type: str) -> List[str]:
+    tags = PRODUCT_TAGS.get(product_type, [])
+    if not tags:
+        return []
+
+    prompt = (
+        f"Analyze this {product_type.lower()}. From the following condition tags, which are visible: "
+        f"{', '.join(tags)}. Return only the relevant tags."
+    )
+    inputs = blip_processor(images=image, text=prompt, return_tensors="pt").to(blip_model.device)
+    with torch.no_grad():
+        output = blip_model.generate(**inputs, max_new_tokens=100)
+        response = blip_processor.decode(output[0], skip_special_tokens=True).lower()
+
+    selected = [tag for tag in tags if tag.lower() in response]
+    return selected
+
+def map_condition_to_score(tags: List[str]) -> int:
+    damage_tags = {
+        "creased toe box", "worn sole", "heel wear", "misaligned heel", "visible scuff marks",
+        "scratched glass", "buckle rusted", "strap discolored", "strap cracked", "zipper broken", "dial dirty",
+        "corners frayed", "logo faded", "torn material", "strap wrinkled", "lens scratched",
+        "hinge loose", "fabric stretched", "collar worn", "lining damaged", "cracked screen",
+        "body dented", "frame scuffed", "holes stretched"
+    }
+    count = sum(1 for tag in tags if tag in damage_tags)
+    return 10 if count == 0 else 8 if count == 1 else 6 if count == 2 else 4
+
+async def call_phi4(product_type: str, material: str, tags: List[str]) -> str:
+    tag_string = ", ".join(tags) if tags else "no visible flaws"
+    prompt = (
+        f"Write a 50-word condition summary for a {material} {product_type} based on these observations: {tag_string}. "
+        f"Describe flaws naturally if present, or highlight good condition otherwise. Avoid exaggeration."
+    )
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                "http://localhost:11434/api/generate",
+                json={"model": "phi4:14b-q4_K_M", "prompt": prompt},
+                timeout=60.0
+            )
+            summary = ""
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line.decode("utf-8"))
+                    summary += data.get("response", "")
+            return summary.strip()
+        except Exception as e:
+            raise RuntimeError(f"Ollama request failed: {e}")
+
+@app.on_event("startup")
+async def startup_warmup():
+    dummy = Image.new("RGB", (224, 224))
+    analyze_with_blip(dummy, OBJECT_LABELS)
+
+@app.post("/analyze-images", response_model=ReportResponse)
+async def analyze_images(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="No images uploaded.")
+
+    all_tags = set()
+    images = []
+
+    for file in files:
+        try:
+            img_bytes = await file.read()
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            if img.width < 100 or img.height < 100:
+                raise ValueError("Image too small.")
+            images.append(img)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+
+    product_type = analyze_with_blip(images[0], OBJECT_LABELS, "object")
+    material = analyze_with_blip(images[0], MATERIAL_LABELS, "material")
+
+    for img in images:
+        tags = extract_tags_batch(img, product_type)
+        all_tags.update(tags)
+
+    unique_tags = sorted(all_tags)
+    condition_score = map_condition_to_score(unique_tags)
+
+    try:
+        report = await call_phi4(product_type, material, unique_tags)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
+
+    return ReportResponse(
+        success=True,
+        product_type=product_type,
+        material=material,
+        condition_score=condition_score,
+        condition_report=report,
+        tags=unique_tags
+    )
