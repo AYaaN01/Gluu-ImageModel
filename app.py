@@ -9,6 +9,7 @@ import httpx
 import json
 import io
 import time
+import logging
 
 app = FastAPI()
 app.add_middleware(
@@ -18,6 +19,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+# Setup FastAPI logging if not already done
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ollama-client")
 
 # Device setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,7 +113,14 @@ async def call_phi4(product_type: str, material: str, tags: List[str]) -> str:
         f"Describe flaws naturally if present, or highlight good condition otherwise. Avoid exaggeration."
     )
     
-    timeout = httpx.Timeout(60.0)
+    logger.info(f"[call_phi4] Sending prompt: {prompt}")
+    
+    timeout = httpx.Timeout(
+        connect=60.0,
+        read=120.0,
+        write=120.0,
+        pool=60.0,
+    )
     
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
@@ -118,19 +130,32 @@ async def call_phi4(product_type: str, material: str, tags: List[str]) -> str:
             )
 
             summary = ""
+
             async for line in response.aiter_lines():
                 line = line.strip()
-                if line:
-                    try:
-                        data = json.loads(line)
-                        chunk = data.get("response", "")
-                        summary += chunk
-                    except json.JSONDecodeError:
-                        continue
+                if not line:
+                    continue
 
+                logger.info(f"[call_phi4] Raw line: {line}")
+
+                try:
+                    data = json.loads(line)
+                    chunk = data.get("response", "")
+                    done = data.get("done", False)
+
+                    logger.info(f"[call_phi4] Chunk: {chunk!r} | Done: {done}")
+
+                    summary += chunk
+
+                except json.JSONDecodeError:
+                    logger.warning(f"[call_phi4] JSON parse failed for line: {line!r}")
+                    continue
+
+            logger.info(f"[call_phi4] Final summary: {summary.strip()}")
             return summary.strip()
 
         except Exception as e:
+            logger.exception(f"[call_phi4] Ollama request failed: {e}")
             print(f"Exception type: {type(e)}, details: {str(e)}")
             raise RuntimeError(f"Ollama request failed: {e}")
 
