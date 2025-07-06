@@ -107,22 +107,24 @@ async def call_phi4(product_type: str, material: str, tags: List[str]) -> str:
         f"Write a 50-word condition summary for a {material} {product_type} based on these observations: {tag_string}. "
         f"Describe flaws naturally if present, or highlight good condition otherwise. Avoid exaggeration."
     )
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(connect=5.0, read=120.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         try:
             response = await client.post(
                 "http://localhost:11434/api/generate",
                 json={"model": "phi4:14b-q4_K_M", "prompt": prompt},
-                timeout=60.0
             )
 
             summary = ""
-            async for chunk in response.aiter_text():
-                if chunk.strip():
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if line:
                     try:
-                        data = json.loads(chunk)
-                        summary += data.get("response", "")
+                        data = json.loads(line)
+                        chunk = data.get("response", "")
+                        summary += chunk
                     except json.JSONDecodeError:
-                        continue  # Ignore bad chunks
+                        continue
 
             return summary.strip()
 
