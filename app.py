@@ -107,7 +107,9 @@ async def call_phi4(product_type: str, material: str, tags: List[str]) -> str:
         f"Write a 50-word condition summary for a {material} {product_type} based on these observations: {tag_string}. "
         f"Describe flaws naturally if present, or highlight good condition otherwise. Avoid exaggeration."
     )
-    timeout = httpx.Timeout(connect=5.0, read=120.0)
+    
+    timeout = httpx.Timeout(60.0)
+    
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
             response = await client.post(
