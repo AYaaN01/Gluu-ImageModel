@@ -127,6 +127,7 @@ async def call_phi4(product_type: str, material: str, tags: List[str]) -> str:
             return summary.strip()
 
         except Exception as e:
+            print(f"Exception type: {type(e)}, details: {str(e)}")
             raise RuntimeError(f"Ollama request failed: {e}")
 
 @app.on_event("startup")
